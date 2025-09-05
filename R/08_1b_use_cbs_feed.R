@@ -417,17 +417,18 @@ grazing <- feed[item_code == 2001, list(grazing = na_sum(feed_use)),
 
 sup <- merge(sup, grazing,
              by = c("area_code", "year", "item_code"), all.x = TRUE)
-sup[item_code == 2001, production := grazing]
+sup[item_code == 2001, `:=`(
+  production = grazing, supply = grazing)]
 sup[, grazing := NULL]
 
 cbs <- merge(cbs, grazing,
              by = c("area_code", "year", "item_code"), all.x = TRUE)
 cbs[item_code == 2001, `:=`(
-  production = grazing, total_supply = na_sum(grazing, imports))]
+  production = grazing, total_supply = grazing, feed = grazing)]
 cbs[, grazing := NULL]
 
 # Clean up
-rm(avg_dairy, bouwman, temp, feed, feed_category, feed_category_lookup, feed_category_b, feed_category_g,
+rm(avg_dairy, bouwman, temp, feed, feed_category_lookup, feed_category_b, feed_category_g,
    grazing, feed_req, feed_sup, live, feed_req_b, feed_req_g, feed_req_k,
    feed_req_g_all_years, conc_b, conc_gleam, conv_b, conv_k, change_rates, poultry)
 

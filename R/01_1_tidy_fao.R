@@ -4,6 +4,7 @@ source("R/01_tidy_functions.R")
 source("R/00_system_variables.R")
 
 regions <- fread("inst/regions_full.csv")
+items <- fread("inst/items_full_123.csv")
 
 
 # Colnames ----------------------------------------------------------------
@@ -35,7 +36,7 @@ rename <- c(
   "Export Quantity" = "exports",
   "Import quantity" = "imports",
   "Export quantity" = "exports",
-  "Domestic supply quantity" = "total_supply",
+  "Domestic supply quantity" = "supply",
   "Losses" = "losses",
   "Loss" = "losses",
   "Food supply quantity (tonnes)" = "food",
@@ -112,12 +113,10 @@ cbs[item == "Groundnuts (Shelled Eq)", `:=` (item_code = 2552, item = "Groundnut
 cbs[item == "Rice (Milled Equivalent)", `:=` (item_code = 2807, item = "Rice and products", value = 1/0.674 * value)]
 # “Unmanufactured tobacco” into "Tobacco"
 cbs[item_code == 826, `:=` (item_code = 2671, item = "Tobacco", value = value)]
+# replace "other" with "Other" in c("Vegetables, other", "Fruits, other", "Cereals, other")
+cbs[item %in% c("Vegetables, other", "Fruits, other", "Cereals, other"),
+    item := sub("other", "Other", item)]
 # Note: Sugar (Raw Equivalent) was also present in old FBS, so we don't need to transform it here
-
-# aggregate tourist consumption into other uses and drop unused elements
-# cbs[element %in% c("Tourist consumption"), element := "Other uses (non-food)"]
-# cbs <- cbs[,.(value = sum(value, na.rm = TRUE)), by = setdiff(names(cbs), "value")]
-# NOTE: we stopped doing this, to have a maximum of detail in the final demand block (but note that this category will be zero before 2014)
 
 # remove unused elements
 cbs <- cbs[! element %in% c("Food supply (kcal/capita/day)",
@@ -154,21 +153,30 @@ cbs <- dt_replace(cbs, function(x) {`<`(x, 0)}, value = 0,
                   cols = c("imports", "exports", "feed", "food", "losses",
                            "other", "processing", "production", "seed"))
 
-cat("Recoding 'total_supply' from",
+cat("Recoding 'supply' from",
     "'production + imports - exports + stock_withdrawal'", "to",
     "'production + imports'.\n")
-cbs[, total_supply := na_sum(production, imports)]
+cbs[, supply := na_sum(production, imports)]
 
 # Add more intuitive 'stock_addition'
 cbs[, stock_addition := -stock_withdrawal]
 
 
-# Rebalance uses, with 'total_supply' and 'stock_additions' treated as given
+# Rebalance uses, with 'supply' and 'stock_additions' treated as given
 cat("\nAdd 'balancing' column for supply and use discrepancies.\n")
-cbs[, balancing := na_sum(total_supply,
+cbs[, balancing := na_sum(supply,
                           -stock_addition, -exports, -food, -feed, -seed, -losses, -processing, -other, -residuals, -tourist)] #
 
 # correct mistakes in stock variation reporting: this was reported with inconsistent signs
+cat("\nExchange stock_addition and stock_withdrawal in",
+    cbs[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
+          (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),.N],
+    "out of", nrow(cbs),
+    "cases where supply and use are balanced after this exchange.",
+    "\nThis assumes a reporting mistake for",
+    round(cbs[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
+                (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),.N] / nrow(cbs) * 100),
+    "% of the data entries.")
 cbs[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
     (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),
     `:=`(stock_addition = -stock_addition,
@@ -179,18 +187,23 @@ cbs[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
 
 cbs[, `:=`(corr = NULL, ratio = NULL)]
 
-# add residuals to balancing
-# cbs[, balancing := balancing + residuals]
-# cbs[, residuals := NULL]
-# NOTE: we stopped doing this, to have a maximum of detail in the final demand block (but note that this category will be zero before 2014)
+# remove negatives in stock_addition and stock_withdrawal variables
+# negative stock additions previously decreased use
+cbs[, `:=`(stock_addition = ifelse(stock_addition < 0, 0, stock_addition))]
+cbs[, `:=`(stock_withdrawal = ifelse(stock_withdrawal < 0, 0, stock_withdrawal))]
+# Each country's supply is the sum of its production and stock withdrawals (i.e. where stock_addition < 0)
+cbs[, `:=`(domestic_supply = na_sum(production, stock_withdrawal))]
+cbs[, `:=`(supply = na_sum(domestic_supply, imports))]
+cbs[, `:=`(domestic_use = na_sum(food, feed, other, tourist, seed, losses, processing, stock_addition))]
+cbs[, `:=`(use = na_sum(domestic_use, exports))]
 
-# fix discrepancies of stock additions with 'total_supply'
+# fix discrepancies of stock additions with 'supply'
 # Note: residuals should capture such inconsistencies now
-cat("Found ", cbs[stock_addition > total_supply, .N],
-    " occurences of 'stock_addition' exceeding 'total_supply'.\n",
+cat("Found ", cbs[stock_addition > supply, .N],
+    " occurences of 'stock_addition' exceeding 'supply'.\n",
     "Keeping values as is.\n", sep = "")
-# cbs[stock_addition > total_supply, stock_addition := total_supply]
-# cbs[stock_addition > total_supply,
+# cbs[stock_addition > supply, stock_addition := supply]
+# cbs[stock_addition > supply,
 #    `:=` (stock_addition = ifelse(stock_addition + balancing < 0, 0, stock_addition + balancing),
 #          balancing = ifelse(stock_addition + balancing < 0, balancing + stock_addition, 0))]
 
@@ -229,7 +242,7 @@ sua <- sua[element %in% c("Production", "Import quantity", "Export quantity",
 sua[, item := iconv(item, from = "latin1", to = "UTF-8")]
 
 # keep only relevant items
-sua <- sua[item_code %in% items_sua$item_code_fcl]
+sua <- sua[item_code %in% items_sua$item_code_fcl & value != 0]
 
 
 # Country / Area adjustments
@@ -250,21 +263,30 @@ sua <- dt_replace(sua, function(x) {`<`(x, 0)}, value = 0,
                   cols = c("imports", "exports", "feed", "food", "losses",
                            "other", "processing", "production", "seed"))
 
-cat("Recoding 'total_supply' from",
+cat("\nRecoding 'supply' from",
     "'production + imports - exports + stock_withdrawal'", "to",
     "'production + imports'.\n")
-sua[, total_supply := na_sum(production, imports)]
+sua[, supply := na_sum(production, imports)]
 
 # Add more intuitive 'stock_addition'
 sua[, stock_addition := -stock_withdrawal]
 
 
-# Rebalance uses, with 'total_supply' and 'stock_additions' treated as given
+# Rebalance uses, with 'supply' and 'stock_additions' treated as given
 cat("\nAdd 'balancing' column for supply and use discrepancies.\n")
-sua[, balancing := na_sum(total_supply,
+sua[, balancing := na_sum(supply,
                           -stock_addition, -exports, -food, -feed, -seed, -losses, -processing, -other, -residuals, -tourist)] #
 
 # correct mistakes in stock variation reporting: this was reported with inconsistent signs
+cat("\nExchange stock_addition and stock_withdrawal in",
+    sua[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
+          (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),.N],
+    "out of", nrow(sua),
+    "cases where supply and use are balanced after this exchange.",
+    "\nThis assumes a reporting mistake for",
+    round(sua[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
+                (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),.N] / nrow(sua) * 100),
+    "% of the data entries.")
 sua[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
     (data.table::between(-2*stock_addition, balancing - 1000, balancing + 1000) & abs(stock_addition) > 1000),
   `:=`(stock_addition = -stock_addition,
@@ -275,25 +297,41 @@ sua[((balancing/stock_addition < -1.9) & is.finite(balancing/stock_addition)) |
 
 sua[, `:=`(corr = NULL, ratio = NULL)]
 
-
-## add FAO codes --> no longer necessary as raw data now already has a column for that
-# fbs_sua_conc <- readxl::read_excel("inst/FBS and SUA list.xlsx")
-# fbs_sua_conc <- fbs_sua_conc[!is.na(fbs_sua_conc$FCL),]
-# fbs_sua_conc <- as.data.table(fbs_sua_conc)[,.(fcl = FCL, cpc = CPC, item = `Item name`)]
-# sua <- merge(sua, fbs_sua_conc[,.(fcl, cpc)], by.x = "item_code", by.y = "cpc", all.x = TRUE)
-# setnames(sua, c("item_code", "fcl"), c("item_code_cpc", "item_code_fcl"))
-## NOTE: consider matching all SUA items to corresponding (aggregate) FABIO item
+# remove negatives in stock_addition and stock_withdrawal variables
+# negative stock additions previously decreased use
+sua[, `:=`(stock_addition = ifelse(stock_addition < 0, 0, stock_addition))]
+sua[, `:=`(stock_withdrawal = ifelse(stock_withdrawal < 0, 0, stock_withdrawal))]
+# Each country's supply is the sum of its production and stock withdrawals (i.e. where stock_addition < 0)
+sua[, `:=`(domestic_supply = na_sum(production, stock_withdrawal))]
+sua[, `:=`(supply = na_sum(domestic_supply, imports))]
+sua[, `:=`(domestic_use = na_sum(food, feed, other, tourist, seed, losses, processing, stock_addition))]
+sua[, `:=`(use = na_sum(domestic_use, exports))]
 
 setnames(sua, "item_code", "item_code_fcl")
 
-# we only use palm fruit and kernels for now
-# sua <- sua[item %in% c("Oil palm fruit", "Palm kernels"),] # "Molasses"
-# sua[, item_code := as.numeric(item_code)]
-
-
-
 # Store
 saveRDS(sua, "data/tidy/sua_tidy.rds")
+
+
+# Match SUA items to corresponding (aggregate) FABIO item
+conc <- fread("inst/conc_btd-cbs.csv")
+sua <- merge(sua, conc[,.(item_code_fcl = btd_item_code, item = btd_item, cbs_item_code, cbs_item, tcf)], 
+             by = c("item_code_fcl", "item"), all.x = TRUE)
+sua <- sua[item_code_fcl != 1276]  # remove fatty acids to avoid double-counting
+sua[, `:=`(item_code_fcl = NULL, item = NULL)]
+setnames(sua, old = c("cbs_item_code", "cbs_item"), new = c("item_code", "item"))
+# remove NAs
+sua <- sua[!is.na(item_code)]
+# Divide numeric columns by tcf to convert into the FABIO item
+num_cols <- setdiff(names(sua)[sapply(sua, is.numeric)], c("area_code", "item_code", "year", "tcf"))
+sua[, (num_cols) := lapply(.SD, function(x) x / tcf), .SDcols = num_cols]
+
+# Aggregate
+sua <- sua[, lapply(.SD, sum, na.rm = TRUE), by = .(area_code, area, item_code, item, year), .SDcols = num_cols]
+
+# Store
+saveRDS(sua, "data/tidy/sua_cbs_tidy.rds")
+
 rm(sua)
 
 
@@ -304,6 +342,7 @@ cat("\nTidying BTD.\n")
 btd <- readRDS("input/fao/btd_prod.rds")
 btd <- dt_rename(btd, rename, drop = TRUE)
 
+btd <- dt_filter(btd, value >= 0 & year %in% years)
 
 # Country / Area adjustments
 for(col in c("reporter_code", "partner_code")) {
@@ -313,22 +352,20 @@ for(col in c("reporter_code", "partner_code")) {
   btd <- area_fix(btd, regions, col = col)
 }
 
-btd <- dt_filter(btd, value >= 0)
+btd <- as.data.table(btd)
+# btd[, imex := factor(gsub("^(Import|Export) (.*)$", "\\1", element))]
+set(btd, j = "imex", value = factor(gsub("^(Import|Export) (.*)$", "\\1", btd$element))) # does the same
+btd[, element := NULL]
 
-btd[, imex := factor(gsub("^(Import|Export) (.*)$", "\\1", element))]
-
-# Apply TCF to observations with 'unit' == "tonnes"
-btd <- merge(btd, fread("inst/tcf_btd.csv"),
-             by = "item_code", all.x = TRUE)
-cat("Applying TCF to trade data, where `unit == 'tonnes'` applies.\n")
-btd[unit != "tonnes", tcf := 1]
-btd <- tcf_apply(btd, na.rm = FALSE, filler = 1, fun = `/`)
-
-# Recode "1000 An" to "head"
-btd[unit == "1000 An", `:=`(value = value * 1000, unit = "Head")]
-btd[unit == "An", `:=`(unit = "head")]
 # Recode "1000 USD" to "usd"
 btd[unit == "1000 USD", `:=`(value = value * 1000, unit = "usd")]
+# Recode "t" to "tonnes"
+btd[unit == "t", `:=`(unit = "tonnes")]
+
+# Check Animal stock units
+btd[item_code %in% items[unit=="1000 animals", item_code] & 
+      unit == "An", `:=`(value = value / 1000, unit = "1000 An")]
+btd[unit == "An", `:=`(unit = "An")]
 
 # Change from reporting & partner country to receiving & supplying country
 btd[, `:=`(from = ifelse(imex == "Import", partner, reporter),
@@ -348,6 +385,16 @@ btd <- dt_filter(btd, from_code != to_code)
 #store full version for sua
 saveRDS(btd, "data/tidy/btd_sua_tidy.rds")
 
+
+# Apply TCF to observations with 'unit' == "tonnes"
+btd <- merge(btd, fread("inst/tcf_btd.csv"),
+             by = "item_code", all.x = TRUE)
+if(btd[is.na(tcf), .N] != 0) {
+  cat("Warning: There are", btd[is.na(tcf), .N], "cases where tcf is NA.\n")
+  btd[unit != "tonnes", tcf := 1]
+}
+btd <- tcf_apply(btd, na.rm = FALSE, filler = 1, fun = `/`)
+
 # Aggregate to CBS items
 btd_conc <- fread("inst/conc_btd-cbs.csv")
 
@@ -355,15 +402,15 @@ cat("Aggregating BTD items to the level of CBS.\n")
 item_match <- match(btd[["item_code"]], btd_conc[["btd_item_code"]])
 btd[, `:=`(item_code = btd_conc$cbs_item_code[item_match],
            item = btd_conc$cbs_item[item_match])]
-# remove items not included in btd_conc (mainly food wastes and by-products for feed)
+# remove items not included in btd_conc (mainly unclassified food preparations, crude organic material and food wastes)
 btd <- btd[!is.na(item_code)]
 btd <- btd[, list(value = na_sum(value)), by = .(from_code, from,
-                                                 to_code, to, item_code, item, year, element, unit)]
+                                                 to_code, to, item_code, item, year, unit)]
 cat("Aggregation from", length(item_match), "to", nrow(btd), "observations.\n")
 
 # Store
 saveRDS(btd, "data/tidy/btd_tidy.rds")
-rm(btd, btd_full, btd_conc, item_match)
+rm(btd, btd_conc, item_match)
 
 
 # # Forestry ----------------------------------------------------------------
@@ -692,12 +739,13 @@ prod_trad[, Production := NULL]
 #                     "item","value"))
 
 prod_trad[, region := NULL]
+
 # save before converting into primary equivalents
 saveRDS(rbind(prod_trad, crop_prim), "data/tidy/prod_trad_full.rds")
 
 
-# Aggregate
-crop <- merge(crop, unique(crop_conc[,.(crop_item_code, cbs_item_code, cbs_item, tcf)]),
+# Build crop dataset
+crop <- merge(prod_trad, unique(crop_conc[,.(crop_item_code, cbs_item_code, cbs_item, tcf)]),
               by.x = "item_code", by.y = "crop_item_code", all.x = TRUE)
 crop <- tcf_apply(crop, fun = `*`, na.rm = TRUE)
 
@@ -713,6 +761,191 @@ saveRDS(rbind(crop, crop_prim), "data/tidy/crop_tidy.rds")
 rm(crop, crop_prim, crop_conc, cbs)
 
 
+source("R/00_prep_functions.R")
+path_fao <- "input/fao/"
+# Fertilizers --------------------------------------------------------------
+# get FAO fertilizer data
+file <- c("fert" = "Inputs_FertilizersNutrient_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+
+# TODO: what is this error? (Currently no solution, can be ignored)
+fa_extract(path_in = path_fao, files = file, path_out=path_fao, 
+           name = names(file))
+fert <- fread(paste0(path_fao,"Inputs_FertilizersNutrient_E_All_Data_(Normalized).csv"))
+
+# rename and filter
+
+fert <- dt_rename(fert, rename = rename, drop = TRUE)
+fert <- fert[year %in% years & element %in% "Agricultural Use",]
+
+# clean up areas
+fert <- area_fix(fert, regions = regions)
+fert <- area_kick(fert, code = 351, pattern = "China", groups = TRUE)
+fert <- area_merge(fert, orig = 206, dest = 276, pattern = "Sudan")
+fert[, iso3c := regions$iso3c[match(area, regions$name)]]
+fert[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+fert <- fert[, .(area = unique(area), value = sum(value, na.rm = TRUE)), 
+             by = .(iso3c, item, year)]
+
+#convert to kg
+fert[, value := value * 1000]    
+
+saveRDS(fert, "data/tidy/fert_tidy.rds")
+
+rm(fert)
+
+# Crop Nutrient Balances ---------------------------------------------------
+#get files from FAO -> TODO: this should be in prep_FAO
+file <- c("Environment_Cropland_nutrient_budget_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+fa_extract(path_in = path_fao, file = file, path_out=path_fao, name = names(file))
+cnb <- fread(paste0(path_fao,"Environment_Cropland_nutrient_budget_E_All_Data_(Normalized).csv"))
+
+#clean up
+cnb <- dt_rename(cnb, rename = rename, drop = TRUE)
+cnb <- cnb[year %in% years, ]
+cnb <- area_fix(cnb, regions = regions)
+cnb <- area_kick(cnb, code = 351, pattern = "China", groups = TRUE)
+cnb <- area_merge(cnb, orig = 206, dest = 276, pattern = "Sudan")
+cnb[, iso3c := regions$iso3c[match(area, regions$name)]]
+
+# aggregate countries not in fabio to RoW
+cnb[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+cnb_sum <- cnb[unit == "t", .(area = unique(area), unit= unique(unit), 
+                              value = sum(value, na.rm = TRUE)), 
+               by = .(iso3c, item, year, element)]
+cnb_mean <- cnb[unit %in% c("kg/ha" , "%"), .(area = unique(area), unit = unique(unit),
+                                              value = mean(value, na.rm = TRUE)), 
+                by = .(iso3c, item, year, element)]
+cnb <- bind_rows(cnb_sum, cnb_mean)
+
+
+# save
+saveRDS(cnb, "data/tidy/cnb_tidy.rds")
+
+rm(cnb, cnb_mean, cnb_sum)
+
+
+# Manure -------------------------------------------------------------------
+#get files from FAO
+file <- c("Environment_LivestockManure_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+fa_extract(path_in = path_fao, file = file, path_out=path_fao, name = names(file))
+manure <- fread(paste0(path_fao,"Environment_LivestockManure_E_All_Data_(Normalized).csv"))
+
+#clean up
+manure <- dt_rename(manure, rename = rename, drop = TRUE)
+manure <- manure[year %in% years, ]
+manure <- area_fix(manure, regions = regions)
+manure <- area_kick(manure, code = 351, pattern = "China", groups = TRUE)
+manure <- area_merge(manure, orig = 206, dest = 276, pattern = "Sudan")
+manure[, iso3c := regions$iso3c[match(area, regions$name)]]
+
+# exclude stocks and duplicate categories
+manure <- manure[element != "Stocks" & !item_code %in% c(1048, 1054, 1126, 
+                                                         1177, 1749, 1755,  
+                                                         1757, 1759, 2029)]
+
+# aggregate countries not in fabio to RoW
+manure[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+manure <- manure[, .(area = unique(area), area_code = unique(area_code),
+                     item_code = unique(item_code), unit = unique(unit),
+                     value = sum(value, na.rm = TRUE)), 
+                 by = .(iso3c, item, year, element)]
+
+# save
+saveRDS(manure, "data/tidy/manure_tidy.rds")
+
+# Emissions from crops -----------------------------------------------------------
+#get files from FAO
+file <- c("Emissions_crops_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+fa_extract(path_in = path_fao, file = file, path_out=path_fao, name = names(file))
+crop_emissions <- fread(paste0(path_fao,"Emissions_crops_E_All_Data_(Normalized).csv"))
+
+#clean up
+crop_emissions <- crop_emissions[ `Source Code` == 3050] # only FAO tier 1 emissions
+crop_emissions <- dt_rename(crop_emissions, rename = rename, drop = TRUE)
+crop_emissions <- crop_emissions[year %in% years, ]
+crop_emissions <- area_fix(crop_emissions, regions = regions)
+crop_emissions <- area_kick(crop_emissions, code = 351, pattern = "China", groups = TRUE)
+crop_emissions <- area_merge(crop_emissions, orig = 206, dest = 276, pattern = "Sudan")
+crop_emissions[, iso3c := regions$iso3c[match(area, regions$name)]]
+
+
+# aggregate countries not in fabio to RoW
+crop_emissions[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+crop_emissions <- crop_emissions[, .(area = unique(area), unit = unique(unit), 
+                                     item_code = unique(item_code),
+                                     value = sum(value, na.rm = TRUE)), 
+                                 by = .(iso3c, item, year, element)]
+
+# replace crop items with cbs items
+conc <- fread("inst/conc_crop-cbs.csv")
+crop_emissions[, `:=` (item_cbs = conc$cbs_item[match(item_code, conc$crop_item_code)],
+                       item_code_cbs = conc$cbs_item_code[match(item_code, conc$crop_item_code)])]
+crop_emissions[!is.na(item_cbs), `:=` (item = item_cbs, item_code = item_code_cbs)][
+  , `:=` (item_cbs = NULL, item_code_cbs = NULL)]
+
+
+# save
+saveRDS(crop_emissions, "data/tidy/crop_emissions_tidy.rds")
+
+
+# Emissions from drained organic soils ----------------------------------------
+#get files from FAO
+file <- c("Emissions_Drained_Organic_Soils_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+fa_extract(path_in = path_fao, file = file, path_out=path_fao, name = names(file))
+drain_emissions <- fread(paste0(path_fao,"Emissions_Drained_Organic_Soils_E_All_Data_(Normalized).csv"))
+
+#clean up
+drain_emissions <- drain_emissions[ `Source Code` == 3050] # only FAO tier 1 emissions
+drain_emissions <- dt_rename(drain_emissions, rename = rename, drop = TRUE)
+drain_emissions <- drain_emissions[year %in% years, ]
+drain_emissions <- area_fix(drain_emissions, regions = regions)
+drain_emissions <- area_kick(drain_emissions, code = 351, pattern = "China", groups = TRUE)
+drain_emissions <- area_merge(drain_emissions, orig = 206, dest = 276, pattern = "Sudan")
+drain_emissions[, iso3c := regions$iso3c[match(area, regions$name)]]
+
+
+# aggregate countries not in fabio to RoW
+drain_emissions[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+drain_emissions <- drain_emissions[, .(area = unique(area), unit= unique(unit), 
+                                       item_code = unique(item_code),
+                                       value = sum(value, na.rm = TRUE)), 
+                                   by = .(iso3c, item, year, element)]
+
+# save
+saveRDS(drain_emissions, "data/tidy/drain_emissions_tidy.rds")
+
+# Emissions from manure ----------------------------------------
+#get files from FAO
+file <- c("Emissions_livestock_E_All_Data_(Normalized).zip")
+fa_dl(file = file, path = path_fao, link = "https://bulks-faostat.fao.org/production/")
+fa_extract(path_in = path_fao, file = file, path_out=path_fao, name = names(file))
+manure_emissions <- fread(paste0(path_fao,"Emissions_livestock_E_All_Data_(Normalized).csv"))
+
+#clean up
+manure_emissions <- manure_emissions[ `Source Code` == 3050] # only FAO tier 1 emissions
+manure_emissions <- dt_rename(manure_emissions, rename = rename, drop = TRUE)
+manure_emissions <- manure_emissions[year %in% years, ]
+manure_emissions <- area_fix(manure_emissions, regions = regions)
+manure_emissions <- area_kick(manure_emissions, code = 351, pattern = "China", groups = TRUE)
+manure_emissions <- area_merge(manure_emissions, orig = 206, dest = 276, pattern = "Sudan")
+manure_emissions[, iso3c := regions$iso3c[match(area, regions$name)]]
+
+
+# aggregate countries not in fabio to RoW
+manure_emissions[is.na(iso3c), `:=` (iso3c = "ROW", area = "RoW", area_code = 999)]
+manure_emissions <- manure_emissions[, .(area = unique(area), unit = unique(unit),
+                                         item_code = unique(item_code),
+                                         value = sum(value, na.rm = TRUE)), 
+                                     by = .(iso3c, item, year, element)]
+
+# save
+saveRDS(manure_emissions, "data/tidy/manure_emissions_tidy.rds")
+
 # Livestock ---------------------------------------------------------------
 
 cat("\nTidying livestock for cbs.\n")
@@ -723,9 +956,9 @@ live_conc <- fread("inst/conc_live-cbs.csv")
 live <- prod[item_code %in% live_conc$live_item_code, ]
 live_trad <- trad[item_code %in% live_conc$live_item_code,]
 
-live <- live[item_code != 1808,] # the Meat, poultry category is incomplete after 2017
-live[item_code %in% c(1058, 1069, 1080, 1084) , item_code := 1808]
-live_trad[item_code %in% c(1057, 1068, 1079, 1083) , item_code := 2029]
+# live <- live[item_code != 1808,] # the Meat, poultry category is incomplete after 2017
+# live[item_code %in% c(1058, 1069, 1080, 1084) , item_code := 1808]
+# live_trad[item_code %in% c(1057, 1068, 1079, 1083) , item_code := 2029]
 
 live <- rbind(live, live_trad)
 
@@ -748,11 +981,12 @@ live <- dt_rename(live, drop = FALSE,
 live <- dt_filter(live, value >= 0)
 
 # Recode units
-live[unit %in% c("1000 Head", "1000 An"), `:=`(value = value * 1000, unit = "head")]
-live[unit %in% c("Head", "An"), `:=`(unit = "head")]
+# live[unit %in% c("1000 Head", "1000 An"), `:=`(value = value * 1000, unit = "An")]
+# live[unit %in% c("Head", "An"), `:=`(unit = "An")]
 live[unit %in% c("1000 US$", "1000 USD"), `:=`(value = value * 1000, unit = "usd")]
 live[unit == "t", `:=`(unit = "tonnes")]
 
+saveRDS(live, "data/tidy/live_tidy.rds")
 
 
 # Prices -------------------------------------------------------------------
@@ -782,7 +1016,7 @@ rm(prices, crop_conc)
 # Technical conversion factors -------------------------------------------------------------------
 
 cat("\nTidying tcfs.\n")
-tcf <- fread("inst/tcf_rates_sua.csv") 
+tcf <- fread("inst/sua/tcf_rates_sua.csv") 
 
 # filter out unneeded items and columns 
 tcf <- tcf[!variable %in% c("seeding rates", "hatching eggs", "waste")]
@@ -800,12 +1034,12 @@ tcf <- unique(tcf, by = c("country_tcf", "item_tcf", "variable"))
 
 
 # country concordance with current SUAs
-country_conc_sua_tcf <-fread("inst/conc_country_sua_tcf.csv")
+country_conc_sua_tcf <-fread("inst/sua/conc_country_sua_tcf.csv")
 tcf[, country_sua := country_conc_sua_tcf$country_sua[match(country_tcf, country_conc_sua_tcf$country_tcf)]]
 
 #item concordance with current suas
 sua <- readRDS("data/tidy/sua_tidy.rds")
-sua_conc <- fread("inst/conc_sua_tcf.csv")
+sua_conc <- fread("inst/sua/conc_sua_tcf.csv")
 sua_conc[, names(sua_conc) := lapply(.SD, function(x) fifelse(x == "", NA, x))]
 tcf[,item_sua := sua_conc$sua[match(item_tcf, sua_conc$tcf)]]
 
